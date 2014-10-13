@@ -234,46 +234,69 @@ end
 module PathMap = Map.Make(Path2)
 let printing_map = ref (Lazy.from_val PathMap.empty)
 
-let rec expand_alias path env =
-  match Env.find_module path env with
-  | { md_type = Mty_alias path' } -> expand_alias path' env
-  | _ -> path
-  | exception Not_found -> path
-
-let rec find_module_aliases acc path = function
-  | Mty_ident _ -> acc
-  | Mty_signature (lazy sg) -> find_sig_aliases acc path sg
-  | Mty_functor _ -> acc
-  | Mty_alias path' -> (path, path', expand_alias path' !printing_env) :: acc
-
-and find_sig_aliases acc path = function
-  | Sig_module (id, { md_type }, _) :: tail ->
-    let acc = find_module_aliases acc (Pdot (path, Ident.name id, 0)) md_type in
-    find_sig_aliases acc path tail
-  | _ :: tail ->
-    find_sig_aliases acc path tail
-  | [] -> acc
-
-let rec find_summary_aliases acc = function
-  | Env.Env_empty -> acc
-  | Env.Env_value (s, _, _) | Env.Env_type (s, _, _)
-  | Env.Env_extension (s, _, _) | Env.Env_open (s, _)
-  | Env.Env_modtype (s, _, _) | Env.Env_class (s, _, _)
-  | Env.Env_cltype (s, _, _) | Env.Env_functor_arg (s, _) ->
-    find_summary_aliases acc s
-  | Env.Env_module (s, id, { md_type }) ->
-    find_summary_aliases (find_module_aliases acc (Pident id) md_type) s
-
-let find_pers_aliases acc env =
-  let aux name acc =
-    let path = Pident (Ident.create_persistent name) in
-    match Env.find_module path env with
-    | exception Not_found -> acc
-    | { md_type } -> find_module_aliases acc path md_type
-  in
-  Concr.fold aux (Env.used_persistent ()) acc
-
 module Shorten_prefix = struct
+
+  let rec expand_alias path env =
+    match Env.find_module path env with
+    | { md_type = Mty_alias path' } -> expand_alias path' env
+    | _ -> path
+    | exception Not_found -> path
+
+  let rec find_module_aliases acc path = function
+    | Mty_ident _ -> acc
+    | Mty_signature (lazy sg) -> find_sig_aliases acc path sg
+    | Mty_functor _ -> acc
+    | Mty_alias path' -> (path, path', expand_alias path' !printing_env) :: acc
+
+  and find_sig_aliases acc path = function
+    | Sig_module (id, { md_type }, _) :: tail ->
+      let acc = find_module_aliases acc (Pdot (path, Ident.name id, 0)) md_type in
+      find_sig_aliases acc path tail
+    | _ :: tail ->
+      find_sig_aliases acc path tail
+    | [] -> acc
+
+  let rec find_top_sig_aliases acc = function
+    | Sig_module (id, { md_type }, _) :: tail ->
+      let acc = find_module_aliases acc (Pident id) md_type in
+      find_top_sig_aliases acc tail
+    | _ :: tail ->
+      find_top_sig_aliases acc tail
+    | [] -> acc
+
+  let rec find_summary_aliases acc = function
+    | Env.Env_empty -> acc
+    | Env.Env_value (s, _, _) | Env.Env_type (s, _, _)
+    | Env.Env_extension (s, _, _) | Env.Env_open (s, _)
+    | Env.Env_modtype (s, _, _) | Env.Env_class (s, _, _)
+    | Env.Env_cltype (s, _, _) | Env.Env_functor_arg (s, _) ->
+      find_summary_aliases acc s
+    | Env.Env_module (s, id, { md_type }) ->
+      find_summary_aliases (find_module_aliases acc (Pident id) md_type) s
+
+  let find_pers_aliases acc env =
+    let aux name acc =
+      let path = Pident (Ident.create_persistent name) in
+      match Env.find_module path env with
+      | exception Not_found -> acc
+      | { md_type } -> find_module_aliases acc path md_type
+    in
+    Concr.fold aux (Env.used_persistent ()) acc
+
+  let rec find_opens opens = function
+    | Env.Env_empty -> opens
+    | Env.Env_value (s, _, _) | Env.Env_type (s, _, _)
+    | Env.Env_extension (s, _, _) | Env.Env_module (s, _, _)
+    | Env.Env_modtype (s, _, _) | Env.Env_class (s, _, _)
+    | Env.Env_cltype (s, _, _) | Env.Env_functor_arg (s, _) ->
+      find_opens opens s
+    | Env.Env_open (s, p) ->
+      let rec traverse_path acc = function
+        | Path.Papply _ -> opens
+        | Path.Pdot (path, name, _) -> traverse_path (name :: acc) path
+        | Path.Pident id -> (p,id,acc) :: opens in
+      find_opens (traverse_path [] p) s
+
   module StringMap = Map.Make(struct
       type t = string
       let compare (a : string) b = compare a b
@@ -283,6 +306,25 @@ module Shorten_prefix = struct
     status: 'a;
     subs: 'a node StringMap.t;
   }
+
+  let add_path status map id dots =
+    let rec create_path status = function
+      | x :: xs ->
+        let subs = StringMap.singleton x (create_path status xs) in
+        {status = `Node; subs}
+      | [] -> {status; subs = StringMap.empty} in
+    let rec add_path status map = function
+      | x :: xs ->
+        let map' = match StringMap.find x map.subs with
+          | exception Not_found -> create_path status xs
+          | map' -> add_path status map' xs in
+        {map with subs = StringMap.add x map' map.subs}
+      | [] -> {map with status} in
+    let sub =
+      match Tbl.find id map with
+      | exception Not_found -> create_path status dots
+      | sub -> add_path status sub dots in
+    Tbl.add id sub map
 
   let table_pers_last = ref Concr.empty
   let table_pers = ref (Tbl.empty, PathMap.empty)
@@ -295,44 +337,33 @@ module Shorten_prefix = struct
     else match !table_cache with
       | Some map -> map
       | None ->
-        let rec create_path status = function
-          | x :: xs ->
-            let subs = StringMap.singleton x (create_path status xs) in
-            {status = `Node; subs}
-          | [] -> {status; subs = StringMap.empty} in
-        let rec add_path status map = function
-          | x :: xs ->
-            let map' = match StringMap.find x map.subs with
-              | exception Not_found -> create_path status xs
-              | map' -> add_path status map' xs in
-            {map with subs = StringMap.add x map' map.subs}
-          | [] -> {map with status} in
-        let add_path status map id dots =
-          let sub =
-            match Tbl.find id map with
-            | exception Not_found -> create_path status dots
-            | sub -> add_path status sub dots in
-          Tbl.add id sub map in
-
         let register_aliases aliases acc =
           List.fold_left (fun (table, revindex) (src, dst, canonical) ->
               Format.eprintf "%a is an alias to %a (absolute name: %a)\n%!"
                 path src path dst path canonical;
               let rec traverse_path acc = function
-                | Path.Papply _ -> raise Not_found
-                | Path.Pdot (path, name, _) -> traverse_path (name :: acc) path
-                | Path.Pident id -> id, acc in
+                | Papply _ -> raise Not_found
+                | Pdot (path, name, _) -> traverse_path (name :: acc) path
+                | Pident id -> id, acc in
               match traverse_path [] src, traverse_path [] dst with
               | exception Not_found -> table, revindex
               | (id1, d1 as path1), (id2, d2) ->
                 add_path (`Remap canonical)
                   (add_path (`Remap canonical) table id2 d2) id1 d1,
-                let list = match PathMap.find canonical revindex with
+                (*let list = match PathMap.find canonical revindex with
                   | result -> result
                   | exception Not_found -> []
-                in
-                PathMap.add canonical (path1 :: list) revindex
+                in*)
+                PathMap.add canonical path1 revindex
             ) acc aliases in
+
+        let register_opens opens acc =
+          List.fold_left (fun (remap_table, open_table, revindex) (path, id, dots) ->
+              let path' = expand_alias path !printing_env in
+              add_path (`Remap path') remap_table id dots,
+              add_path `Opened open_table id dots,
+              PathMap.add path' (id, dots) revindex
+            ) acc opens in
 
         let remap_table =
           let pers = Env.used_persistent () in
@@ -350,22 +381,9 @@ module Shorten_prefix = struct
           let aliases = find_summary_aliases [] (Env.summary !printing_env) in
           register_aliases aliases remap_table in
 
-        let rec add_opens map = function
-          | Env.Env_empty -> map
-          | Env.Env_value (s, _, _) | Env.Env_type (s, _, _)
-          | Env.Env_extension (s, _, _) | Env.Env_module (s, _, _)
-          | Env.Env_modtype (s, _, _) | Env.Env_class (s, _, _)
-          | Env.Env_cltype (s, _, _) | Env.Env_functor_arg (s, _) ->
-            add_opens map s
-          | Env.Env_open (s, p) ->
-            let rec traverse_path acc = function
-              | Path.Papply _ -> add_opens map s
-              | Path.Pdot (path, name, _) -> traverse_path (name :: acc) path
-              | Path.Pident id -> add_opens (add_path `Opened map id acc) s in
-            traverse_path [] p in
+        let opens = find_opens [] (Env.summary !printing_env) in
+        let table = register_opens opens (remap_table, Tbl.empty, remap_index) in
 
-        let open_table = add_opens Tbl.empty (Env.summary !printing_env) in
-        let table = remap_table, open_table, remap_index in
         table_cache := Some table;
         table
 
@@ -414,7 +432,7 @@ module Shorten_prefix = struct
             | (x :: xs as path) ->
               match map.status with
               | `Remap path' ->
-                let rec select_shortest len sol = function
+                (*let rec select_shortest len sol = function
                   | [] -> sol
                   | (_, xs) as sol' :: xss ->
                     let len' = List.length xs in
@@ -425,8 +443,9 @@ module Shorten_prefix = struct
                 in
                 let x, xs = select_shortest max_int ("",[])
                     (List.map (fun (a,b) -> shorten_root a b)
-                       (PathMap.find path' remap_index)) in
-                x, (xs @ path)
+                       (PathMap.find path' remap_index)) in*)
+                let x, xs = PathMap.find path' remap_index in
+                shorten_root x (xs @ path)
               | `Node ->
                 find_remap (StringMap.find x map.subs) xs
           in
