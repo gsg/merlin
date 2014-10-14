@@ -260,6 +260,10 @@ val fold_cltypes:
 (** Utilities *)
 val scrape_alias: t -> module_type -> module_type
 
+type param_subst = Id | Nth of int | Map of int list
+val normalize_type_path: ?cache:bool -> t -> Path.t -> Path.t * param_subst
+
+val persistent_type_map: t -> string -> (Path.t * param_subst) Pathtrie.Map.t
 
 (** merlin: manage all internal state *)
 

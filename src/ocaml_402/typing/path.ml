@@ -52,3 +52,13 @@ let rec last = function
   | Pident id -> Ident.name id
   | Pdot(_, s, _) -> s
   | Papply(_, p) -> last p
+
+let rec size = function
+    Pident id ->
+      (let s = Ident.name id in if s <> "" && s.[0] = '_' then 10 else 1),
+      -Ident.binding_time id
+  | Pdot (p, _, _) ->
+      let (l, b) = size p in (1+l, b)
+  | Papply (p1, p2) ->
+      let (l, b) = size p1 in
+      (l + fst (size p2), b)

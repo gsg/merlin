@@ -200,11 +200,14 @@ and functor_components = {
   fcomp_subst_cache: (Path.t, module_type) Hashtbl.t
 }
 
+type param_subst = Id | Nth of int | Map of int list
+
 (* Persistent structure descriptions *)
 
 type pers_struct =
   { ps_name: string;
     ps_sig: signature;
+    mutable ps_short_pathmap: (Path.t * param_subst) Pathtrie.Map.t option;
     ps_comps: module_components;
     ps_crcs: (string * Digest.t option) list;
     mutable ps_crcs_checked: bool;
@@ -365,6 +368,7 @@ let read_pers_struct modname filename =
              ps_filename = filename;
              ps_flags = flags;
              ps_crcs_checked = false;
+             ps_short_pathmap = None;
            } in
   if ps.ps_name <> modname then
     error (Illegal_renaming(modname, ps.ps_name, filename));
@@ -1000,10 +1004,12 @@ let same_types env1 env2 =
   env1.types == env2.types && env1.components == env2.components
 
 let used_persistent () =
-  let r = ref Concr.empty in
-  Hashtbl.iter (fun s pso -> if pso != None then r := Concr.add s !r)
-    !cache.persistent_structures;
-  !r
+  Hashtbl.fold
+    (fun s pso acc ->
+       if pso != None then Concr.add s acc
+       else acc)
+    !cache.persistent_structures
+    Concr.empty
 
 let find_all_comps proj s (p,mcomps) =
   match EnvLazy.force !components_of_module_maker' mcomps with
@@ -1109,6 +1115,76 @@ let rec scrape_alias env ?path mty =
   | _ -> mty
 
 let scrape_alias env mty = scrape_alias env mty
+
+let normalize_type_path ?(cache = false) env p =
+  let rec index l x =
+    match l with
+      [] -> raise Not_found
+    | a :: l -> if x == a then 0 else 1 + index l x in
+  let rec uniq = function
+      [] -> true
+    | a :: l -> not (List.memq a l) && uniq l in
+  let compose l1 = function
+    | Id -> Map l1
+    | Map l2 -> Map (List.map (List.nth l1) l2)
+    | Nth n  -> Nth (List.nth l1 n) in
+  let rec aux p =
+    try
+      let (params, ty, _) = find_type_expansion p env in
+      let params = List.map repr params in
+      match repr ty with
+        {desc = Tconstr (p1, tyl, _)} ->
+        let tyl = List.map repr tyl in
+        if List.length params = List.length tyl
+        && List.for_all2 (==) params tyl
+        && p != p1
+        then aux p1
+        else if cache || List.length params <= List.length tyl
+                || not (uniq tyl) then (p, Id)
+        else
+          let l1 = List.map (index params) tyl in
+          let (p2, s2) = aux p1 in
+          (p2, compose l1 s2)
+      | ty ->
+        (p, Nth (index params ty))
+    with
+      Not_found -> (p, Id)
+  in
+  aux p
+
+let persistent_type_map env name =
+  match Hashtbl.find !cache.persistent_structures name with
+  | exception Not_found -> Pathtrie.Map.empty
+  | None -> Pathtrie.Map.empty
+  | Some { ps_short_pathmap = Some map } -> map
+  | Some ps ->
+    let rec fold_types f path acc = function
+      | Sig_type (id, _, _) :: xs ->
+        fold_types f path (f (Path.Pdot (path, Ident.name id, 0)) acc) xs
+      | Sig_module (id, { md_type = Mty_signature (lazy sg) }, _) :: xs ->
+        let acc = fold_types f (Path.Pdot (path, Ident.name id, 0)) acc sg in
+        fold_types f path acc xs
+      | _ :: xs  -> fold_types f path acc xs
+      | [] -> acc in
+    let register_type path acc =
+      let path', subst = normalize_type_path ~cache:true env path in
+      if Path.same path path' then
+        acc
+      else
+      if try
+          let pold, _ = Pathtrie.Map.find path' acc in
+          Path.size path < Path.size pold
+        with Not_found -> true
+      then
+        Pathtrie.Map.add path' (path, subst) acc
+      else
+        acc
+    in
+    let root = Path.Pident (Ident.create_persistent name) in
+    let map = Pathtrie.Map.empty in
+    let map = fold_types register_type root map ps.ps_sig in
+    ps.ps_short_pathmap <- Some map;
+    map
 
 (* Compute constructor descriptions *)
 
@@ -1683,6 +1759,7 @@ let save_signature_with_imports sg modname filename imports =
         ps_filename = filename;
         ps_flags = cmi.cmi_flags;
         ps_crcs_checked = false;
+        ps_short_pathmap = None;
       } in
     Hashtbl.add !cache.persistent_structures modname (Some ps);
     Consistbl.set !cache.crc_units modname crc filename;

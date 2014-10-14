@@ -200,39 +200,18 @@ let () = Btype.print_raw := raw_type_expr
 
 (* Normalize paths *)
 
-type param_subst = Id | Nth of int | Map of int list
-
-let compose l1 = function
-  | Id -> Map l1
-  | Map l2 -> Map (List.map (List.nth l1) l2)
-  | Nth n  -> Nth (List.nth l1 n)
-
 let apply_subst s1 tyl =
   match s1 with
-    Nth n1 -> [List.nth tyl n1]
-  | Map l1 -> List.map (List.nth tyl) l1
-  | Id -> tyl
+    Env.Nth n1 -> [List.nth tyl n1]
+  | Env.Map l1 -> List.map (List.nth tyl) l1
+  | Env.Id -> tyl
 
 type best_path = Paths of Path.t list | Best of Path.t
 
 let printing_env = ref Env.empty
 let printing_old = ref Env.empty
 let printing_pers = ref Concr.empty
-module Path2 = struct
-  include Path
-  let rec compare p1 p2 =
-    (* must ignore position when comparing paths *)
-    match (p1, p2) with
-      (Pdot(p1, s1, pos1), Pdot(p2, s2, pos2)) ->
-        let c = compare p1 p2 in
-        if c <> 0 then c else String.compare s1 s2
-    | (Papply(fun1, arg1), Papply(fun2, arg2)) ->
-        let c = compare fun1 fun2 in
-        if c <> 0 then c else compare arg1 arg2
-    | _ -> Pervasives.compare p1 p2
-end
-module PathMap = Map.Make(Path2)
-let printing_map = ref (Lazy.from_val PathMap.empty)
+let printing_map = ref (Lazy.from_val Pathtrie.Map.empty)
 
 module Shorten_prefix = struct
 
@@ -291,49 +270,19 @@ module Shorten_prefix = struct
     | Env.Env_cltype (s, _, _) | Env.Env_functor_arg (s, _) ->
       find_opens opens s
     | Env.Env_open (s, p) ->
-      let rec traverse_path acc = function
-        | Path.Papply _ -> opens
-        | Path.Pdot (path, name, _) -> traverse_path (name :: acc) path
-        | Path.Pident id -> (p,id,acc) :: opens in
-      find_opens (traverse_path [] p) s
-
-  module StringMap = Map.Make(struct
-      type t = string
-      let compare (a : string) b = compare a b
-    end)
-
-  type 'a node = {
-    status: 'a;
-    subs: 'a node StringMap.t;
-  }
-
-  let add_path status map id dots =
-    let rec create_path status = function
-      | x :: xs ->
-        let subs = StringMap.singleton x (create_path status xs) in
-        {status = `Node; subs}
-      | [] -> {status; subs = StringMap.empty} in
-    let rec add_path status map = function
-      | x :: xs ->
-        let map' = match StringMap.find x map.subs with
-          | exception Not_found -> create_path status xs
-          | map' -> add_path status map' xs in
-        {map with subs = StringMap.add x map' map.subs}
-      | [] -> {map with status} in
-    let sub =
-      match Tbl.find id map with
-      | exception Not_found -> create_path status dots
-      | sub -> add_path status sub dots in
-    Tbl.add id sub map
+      match Pathtrie.flatten_path p with
+      | exception Pathtrie.Invalid_path ->
+        opens
+      | flat -> find_opens ((p, flat) :: opens) s
 
   let table_pers_last = ref Concr.empty
-  let table_pers = ref (Tbl.empty, PathMap.empty)
+  let table_pers = ref (Tbl.empty, Pathtrie.Map.empty)
 
   let table_cache = ref None
 
   let get_opened () =
     if !printing_env == Env.empty then
-      Tbl.empty, Tbl.empty, PathMap.empty
+      Tbl.empty, Tbl.empty, Pathtrie.Map.empty
     else match !table_cache with
       | Some map -> map
       | None ->
@@ -347,22 +296,25 @@ module Shorten_prefix = struct
                 | Pident id -> id, acc in
               match traverse_path [] src, traverse_path [] dst with
               | exception Not_found -> table, revindex
-              | (id1, d1 as path1), (id2, d2) ->
-                add_path (`Remap canonical)
-                  (add_path (`Remap canonical) table id2 d2) id1 d1,
-                (*let list = match PathMap.find canonical revindex with
+              | flat1, flat2 ->
+                let table = Pathtrie.add_flat ~default:`Node
+                    flat2 (`Remap canonical) table in
+                let table = Pathtrie.add_flat ~default:`Node
+                    flat1 (`Remap canonical) table in
+                table,
+                (*let list = match Pathtrie.Map.find canonical revindex with
                   | result -> result
                   | exception Not_found -> []
                 in*)
-                PathMap.add canonical path1 revindex
+                Pathtrie.Map.add canonical flat1 revindex
             ) acc aliases in
 
         let register_opens opens acc =
-          List.fold_left (fun (remap_table, open_table, revindex) (path, id, dots) ->
+          List.fold_left (fun (remap_table, open_table, revindex) (path, flat) ->
               let path' = expand_alias path !printing_env in
-              add_path (`Remap path') remap_table id dots,
-              add_path `Opened open_table id dots,
-              PathMap.add path' (id, dots) revindex
+              Pathtrie.add_flat ~default:`Node flat (`Remap path') remap_table,
+              Pathtrie.add_flat ~default:`Node flat `Opened open_table,
+              Pathtrie.Map.add path' flat revindex
             ) acc opens in
 
         let remap_table =
@@ -371,7 +323,7 @@ module Shorten_prefix = struct
             !table_pers
           else
             let aliases = find_pers_aliases [] !printing_env in
-            let table = register_aliases aliases (Tbl.empty, PathMap.empty) in
+            let table = register_aliases aliases (Tbl.empty, Pathtrie.Map.empty) in
             table_pers_last := pers;
             table_pers := table;
             table
@@ -410,9 +362,9 @@ module Shorten_prefix = struct
         let rec shorten_path map path = match path with
           | [] -> raise Not_found
           | x :: xs ->
-            match StringMap.find x map.subs with
+            match Pathtrie.StringMap.find x map.Pathtrie.subs with
             | exception Not_found ->
-              begin match map.status with
+              begin match map.Pathtrie.value with
                 | `Opened -> x, xs
                 | `Node -> raise Not_found
               end
@@ -430,24 +382,12 @@ module Shorten_prefix = struct
           let rec find_remap map = function
             | [] -> raise Not_found
             | (x :: xs as path) ->
-              match map.status with
+              match map.Pathtrie.value with
               | `Remap path' ->
-                (*let rec select_shortest len sol = function
-                  | [] -> sol
-                  | (_, xs) as sol' :: xss ->
-                    let len' = List.length xs in
-                    if len' < len then
-                      select_shortest len' sol' xss
-                    else
-                      select_shortest len sol xss
-                in
-                let x, xs = select_shortest max_int ("",[])
-                    (List.map (fun (a,b) -> shorten_root a b)
-                       (PathMap.find path' remap_index)) in*)
-                let x, xs = PathMap.find path' remap_index in
+                let x, xs = Pathtrie.Map.find path' remap_index in
                 shorten_root x (xs @ path)
               | `Node ->
-                find_remap (StringMap.find x map.subs) xs
+                find_remap (Pathtrie.StringMap.find x map.Pathtrie.subs) xs
           in
           match find_remap (Tbl.find id remap_table) xs with
           | exception Not_found -> shorten_root id xs
@@ -466,47 +406,6 @@ end
 
 let same_type t t' = repr t == repr t'
 
-let rec index l x =
-  match l with
-    [] -> raise Not_found
-  | a :: l -> if x == a then 0 else 1 + index l x
-
-let rec uniq = function
-    [] -> true
-  | a :: l -> not (List.memq a l) && uniq l
-
-let rec normalize_type_path ?(cache=false) env p =
-  try
-    let (params, ty, _) = Env.find_type_expansion p env in
-    let params = List.map repr params in
-    match repr ty with
-      {desc = Tconstr (p1, tyl, _)} ->
-        let tyl = List.map repr tyl in
-        if List.length params = List.length tyl
-        && List.for_all2 (==) params tyl
-        && p != p1
-        then normalize_type_path ~cache env p1
-        else if cache || List.length params <= List.length tyl
-             || not (uniq tyl) then (p, Id)
-        else
-          let l1 = List.map (index params) tyl in
-          let (p2, s2) = normalize_type_path ~cache env p1 in
-          (p2, compose l1 s2)
-    | ty ->
-        (p, Nth (index params ty))
-  with
-    Not_found -> (p, Id)
-
-let rec path_size = function
-    Pident id ->
-      (let s = Ident.name id in if s <> "" && s.[0] = '_' then 10 else 1),
-      -Ident.binding_time id
-  | Pdot (p, _, _) ->
-      let (l, b) = path_size p in (1+l, b)
-  | Papply (p1, p2) ->
-      let (l, b) = path_size p1 in
-      (l + fst (path_size p2), b)
-
 let same_printing_env env =
   let used_pers = Env.used_persistent () in
   Env.same_types !printing_old env && Concr.equal !printing_pers used_pers
@@ -521,19 +420,19 @@ let set_printing_env env =
     printing_pers := Env.used_persistent ();
     printing_map := lazy begin
       (* printf "Recompute printing_map.@."; *)
-      let map = ref PathMap.empty in
+      let map = ref Pathtrie.Map.empty in
       Env.iter_types
         (fun p (p', decl) ->
-          let (p1, s1) = normalize_type_path env p' ~cache:true in
+          let (p1, s1) = Env.normalize_type_path env p' ~cache:true in
           (* Format.eprintf "%a -> %a = %a@." path p path p' path p1 *)
-          if s1 = Id then
+          if s1 = Env.Id then
           try
-            let r = PathMap.find p1 !map in
+            let r = Pathtrie.Map.find p1 !map in
             match !r with
               Paths l -> r := Paths (p :: l)
             | Best _  -> assert false
           with Not_found ->
-            map := PathMap.add p1 (ref (Paths [p])) !map)
+            map := Pathtrie.Map.add p1 (ref (Paths [p])) !map)
         env;
       !map
     end
@@ -552,7 +451,7 @@ let is_unambiguous path env =
     [] -> true
   | p :: rem ->
       (* allow also coherent paths:  *)
-      let normalize p = fst (normalize_type_path ~cache:true env p) in
+      let normalize p = fst (Env.normalize_type_path ~cache:true env p) in
       let p' = normalize p in
       List.for_all (fun p -> Path.same (normalize p) p') rem ||
       (* also allow repeatedly defining and opening (for toplevel) *)
@@ -570,21 +469,21 @@ let rec get_best_path r =
         (fun p ->
           (* Format.eprintf "evaluating %a@." path p; *)
           match !r with
-            Best p' when path_size p >= path_size p' -> ()
+            Best p' when Path.size p >= Path.size p' -> ()
           | _ -> if is_unambiguous p !printing_env then r := Best p)
               (* else Format.eprintf "%a ignored as ambiguous@." path p *)
         l;
       get_best_path r
 
 let best_type_path p =
-  if !printing_env == Env.empty then (p, Id)
+  if !printing_env == Env.empty then (p, Env.Id)
   else match Clflags.real_paths () with
-    | `Real  -> (p, Id)
-    | `Short -> (Shorten_prefix.shorten p, Id)
+    | `Real  -> (p, Env.Id)
+    | `Short -> (Shorten_prefix.shorten p, Env.Id)
     | `Slow  ->
-      let (p', s) = normalize_type_path !printing_env p in
+      let (p', s) = Env.normalize_type_path !printing_env p in
       let p'' =
-        try get_best_path (PathMap.find  p' (Lazy.force !printing_map))
+        try get_best_path (Pathtrie.Map.find  p' (Lazy.force !printing_map))
         with Not_found -> p'
       in
       (* Format.eprintf "%a = %a -> %a@." path p path p' path p''; *)
@@ -673,7 +572,7 @@ let aliasable ty =
   match ty.desc with
     Tvar _ | Tunivar _ | Tpoly _ -> false
   | Tconstr (p, _, _) ->
-      (match best_type_path p with (_, Nth _) -> false | _ -> true)
+      (match best_type_path p with (_, Env.Nth _) -> false | _ -> true)
   | _ -> true
 
 let namable_row row =
@@ -793,7 +692,7 @@ let rec tree_of_typexp sch ty =
         Otyp_tuple (tree_of_typlist sch tyl)
     | Tconstr(p, tyl, abbrev) ->
         begin match best_type_path p with
-          (_, Nth n) -> tree_of_typexp sch (List.nth tyl n)
+          (_, Env.Nth n) -> tree_of_typexp sch (List.nth tyl n)
         | (p', s) ->
             let tyl' = apply_subst s tyl in
             Otyp_constr (tree_of_path p', tree_of_typlist sch tyl')
@@ -816,7 +715,7 @@ let rec tree_of_typexp sch ty =
         begin match row.row_name with
         | Some(p, tyl) when namable_row row ->
             let (p', s) = best_type_path p in
-            assert (s = Id);
+            assert (s = Env.Id);
             let id = tree_of_path p' in
             let args = tree_of_typlist sch tyl in
             if row.row_closed && all_present then
@@ -908,7 +807,7 @@ and tree_of_typobject sch fi nm =
       let non_gen = is_non_gen sch (repr ty) in
       let args = tree_of_typlist sch tyl in
       let (p', s) = best_type_path p in
-      assert (s = Id);
+      assert (s = Env.Id);
       Otyp_class (non_gen, tree_of_path p', args)
   | _ ->
       fatal_error "Printtyp.tree_of_typobject"
@@ -1466,8 +1365,8 @@ let same_path t t' =
     Tconstr(p,tl,_), Tconstr(p',tl',_) ->
       let (p1, s1) = best_type_path p and (p2, s2)  = best_type_path p' in
       begin match s1, s2 with
-        Nth n1, Nth n2 when n1 = n2 -> true
-      | (Id | Map _), (Id | Map _) when Path.same p1 p2 ->
+        Env.Nth n1, Env.Nth n2 when n1 = n2 -> true
+      | (Env.Id | Env.Map _), (Env.Id | Env.Map _) when Path.same p1 p2 ->
           let tl = apply_subst s1 tl and tl' = apply_subst s2 tl' in
           List.length tl = List.length tl' &&
           List.for_all2 same_type tl tl'
