@@ -1152,37 +1152,68 @@ let normalize_type_path ?(cache = false) env p =
   in
   aux p
 
+let compute_type_map env name sg =
+  let rec fold_types f path acc = function
+    | Sig_type (id, _, _) :: xs ->
+      fold_types f path (f (Path.Pdot (path, Ident.name id, 0)) acc) xs
+    | Sig_module (id, { md_type = Mty_signature (lazy sg) }, _) :: xs ->
+      let acc = fold_types f (Path.Pdot (path, Ident.name id, 0)) acc sg in
+      fold_types f path acc xs
+    | _ :: xs  -> fold_types f path acc xs
+    | [] -> acc in
+  let register_type path acc =
+    let path', subst = normalize_type_path ~cache:true env path in
+    if Path.same path path' then
+      acc
+    else
+    if try
+        let pold, _ = Pathtrie.Map.find path' acc in
+        Path.size path < Path.size pold
+      with Not_found -> true
+    then
+      Pathtrie.Map.add path' (path, subst) acc
+    else
+      acc
+  in
+  let root = Path.Pident (Ident.create_persistent name) in
+  let map = Pathtrie.Map.empty in
+  fold_types register_type root map sg
+
+let compute_alias_map env name sg =
+  let rec expand_alias path =
+    match find_module path env with
+    | { md_type = Mty_alias path' } -> expand_alias path'
+    | _ -> path
+    | exception Not_found -> path in
+
+  let rec find_module_aliases acc path = function
+    | Mty_ident _ -> acc
+    | Mty_signature (lazy sg) -> find_sig_aliases acc path sg
+    | Mty_functor _ -> acc
+    | Mty_alias path' -> (path, expand_alias path') :: acc
+
+  and find_sig_aliases acc path = function
+    | Sig_module (id, { md_type }, _) :: tail ->
+      let acc = find_module_aliases acc (Pdot (path, Ident.name id, 0)) md_type in
+      find_sig_aliases acc path tail
+    | _ :: tail ->
+      find_sig_aliases acc path tail
+    | [] -> acc
+
+  in
+  let root = Path.Pident (Ident.create_persistent name) in
+  let aliases = find_sig_aliases [] root sg in
+  ()
+
+
+
 let persistent_type_map env name =
   match Hashtbl.find !cache.persistent_structures name with
   | exception Not_found -> Pathtrie.Map.empty
   | None -> Pathtrie.Map.empty
   | Some { ps_short_pathmap = Some map } -> map
   | Some ps ->
-    let rec fold_types f path acc = function
-      | Sig_type (id, _, _) :: xs ->
-        fold_types f path (f (Path.Pdot (path, Ident.name id, 0)) acc) xs
-      | Sig_module (id, { md_type = Mty_signature (lazy sg) }, _) :: xs ->
-        let acc = fold_types f (Path.Pdot (path, Ident.name id, 0)) acc sg in
-        fold_types f path acc xs
-      | _ :: xs  -> fold_types f path acc xs
-      | [] -> acc in
-    let register_type path acc =
-      let path', subst = normalize_type_path ~cache:true env path in
-      if Path.same path path' then
-        acc
-      else
-      if try
-          let pold, _ = Pathtrie.Map.find path' acc in
-          Path.size path < Path.size pold
-        with Not_found -> true
-      then
-        Pathtrie.Map.add path' (path, subst) acc
-      else
-        acc
-    in
-    let root = Path.Pident (Ident.create_persistent name) in
-    let map = Pathtrie.Map.empty in
-    let map = fold_types register_type root map ps.ps_sig in
+    let map = compute_type_map env name ps.ps_sig in
     ps.ps_short_pathmap <- Some map;
     map
 
