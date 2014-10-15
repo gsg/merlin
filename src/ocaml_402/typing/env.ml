@@ -207,7 +207,7 @@ type param_subst = Id | Nth of int | Map of int list
 type pathmap = {
   (* Map a canonical type path (abstract or generative) to an alias in current
      module, with a substitution for type parameters *)
-  type_revindex: (Path.t * param_subst) list Pathtrie.Map.t;
+  type_revindex: Path.t list Pathtrie.Map.t;
   (* Map a path in current module to a canonically expanded module path
     (without aliases) *)
   module_index: Path.t option Pathtrie.t;
@@ -1164,6 +1164,19 @@ let normalize_type_path ?(cache = false) env p =
   in
   aux p
 
+let ident_pervasive = Ident.create_persistent "Pervasives"
+let rec print_path ppf = function
+  | Pident id ->
+      Format.pp_print_string ppf (Ident.name id)
+  | Pdot(Pident id, s, pos) when Ident.same id ident_pervasive ->
+      Format.pp_print_string ppf s
+  | Pdot(p, s, pos) ->
+      print_path ppf p;
+      Format.pp_print_char ppf '.';
+      Format.pp_print_string ppf s
+  | Papply(p1, p2) ->
+      Format.fprintf ppf "%a(%a)" print_path p1 print_path p2
+
 let compute_type_map env root sg =
   let rec fold_types f path acc = function
     | Sig_type (id, _, _) :: xs ->
@@ -1175,15 +1188,16 @@ let compute_type_map env root sg =
     | [] -> acc in
   let register_type path acc =
     let path', subst = normalize_type_path ~cache:true env path in
-    if Path.same path path' then
+    if Path.same path path' || subst <> Id then
       acc
-    else if try
-        match Pathtrie.Map.find path' acc with
-        | (pold, _) :: _ -> Path.size path < Path.size pold
-        | _ -> true
-      with Not_found -> true
-    then Pathtrie.Map.add path' [path, subst] acc
-    else acc
+    else begin
+      Format.eprintf "%a is a type alias to %a\n%!"
+        print_path path print_path path';
+      let xs = match Pathtrie.Map.find path' acc with
+        | exception Not_found -> []
+        | xs -> xs in
+      Pathtrie.Map.add path' (path :: xs) acc
+    end
   in
   let map = Pathtrie.Map.empty in
   fold_types register_type root map sg
@@ -1199,7 +1213,11 @@ let compute_alias_map env root sg =
     | Mty_ident _ -> acc
     | Mty_signature (lazy sg) -> find_sig_aliases acc path sg
     | Mty_functor _ -> acc
-    | Mty_alias path' -> (path, expand_alias path' env) :: acc
+    | Mty_alias path' ->
+      let canonical = expand_alias path' env in
+      Format.eprintf "%a is a module alias to %a = %a\n%!"
+        print_path path print_path path' print_path canonical;
+      (path, canonical) :: acc
 
   and find_sig_aliases acc path = function
     | Sig_module (id, { md_type }, _) :: tail ->
@@ -1212,13 +1230,11 @@ let compute_alias_map env root sg =
   let aliases = find_sig_aliases [] root sg in
   let register_alias (index, revindex) (path, dest) =
     Pathtrie.add_path ~default:None path (Some dest) index,
-    begin if try
-        match Pathtrie.Map.find dest revindex with
-        | pold :: _ -> Path.size path < Path.size pold
-        | _ -> true
-      with Not_found -> true
-      then Pathtrie.Map.add dest [path] revindex
-      else revindex
+    begin
+      let xs = match Pathtrie.Map.find dest revindex with
+        | exception Not_found -> []
+        | xs -> xs in
+      Pathtrie.Map.add dest (path :: xs) revindex
     end in
   List.fold_left register_alias (Tbl.empty, Pathtrie.Map.empty) aliases
 
@@ -1233,6 +1249,20 @@ let pathmap_empty = {
   module_revindex = Pathtrie.Map.empty;
 }
 
+let print_moduleindex id =
+  let rec in_level n level =
+    begin match level.Pathtrie.value with
+      | None -> ()
+      | Some path' -> Format.eprintf "%sremap to %a" n print_path path'
+    end;
+    Pathtrie.StringMap.iter (fun name level ->
+        let n = n ^ "." ^ name in
+        Format.eprintf "%s" n;
+        in_level n level
+      ) level.Pathtrie.subs;
+  in
+  in_level (Ident.name id)
+
 let persistent_pathmap env name =
   match Hashtbl.find !cache.persistent_structures name with
   | exception Not_found -> pathmap_empty
@@ -1243,6 +1273,7 @@ let persistent_pathmap env name =
     let type_revindex = compute_type_map env root ps.ps_sig in
     let module_index, module_revindex =
       compute_alias_map env root ps.ps_sig in
+    Tbl.iter print_moduleindex module_index;
     let map = {type_revindex; module_index; module_revindex} in
     ps.ps_short_pathmap <- Some map;
     map

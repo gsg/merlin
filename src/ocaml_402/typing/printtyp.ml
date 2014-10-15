@@ -277,8 +277,11 @@ module Shorten_prefix = struct
               | xs -> xs
               | exception Not_found -> []
             in
-            Pathtrie.Map.add p1 (x @ xs) tymap)
-            x.Env.type_revindex xs.Env.type_revindex;
+            let xs = (x @ xs) in
+            Format.eprintf "reverse candidates for type %a:\n%!" path p1;
+            List.iter (Format.eprintf "- %a\n%!" path) xs;
+            Pathtrie.Map.add p1 xs tymap)
+          x.Env.type_revindex xs.Env.type_revindex;
       module_index = Tbl.fold Tbl.add x.Env.module_index xs.Env.module_index;
       module_revindex =
         Pathtrie.Map.fold (fun p1 x tymap ->
@@ -286,7 +289,10 @@ module Shorten_prefix = struct
               | xs -> xs
               | exception Not_found -> []
             in
-            Pathtrie.Map.add p1 (x @ xs) tymap)
+            let xs = (x @ xs) in
+            Format.eprintf "reverse candidates for module %a:\n%!" path p1;
+            List.iter (Format.eprintf "- %a\n%!" path) xs;
+            Pathtrie.Map.add p1 xs tymap)
           x.Env.module_revindex xs.Env.module_revindex;
     }
 
@@ -298,10 +304,32 @@ module Shorten_prefix = struct
       | None ->
         let env = !printing_env in
         let opens = find_opens [] (Env.summary env) in
+        let add_persistent' (deps,pms as acc) name =
+          let id = Ident.create_persistent name in
+          if not (Tbl.mem id pms.Env.module_index) then
+            let pm = Env.persistent_pathmap env name in
+            Pathtrie.Map.fold (fun path _ deps ->
+                let id = Path.head path in
+                if Ident.binding_time id <> 0 then deps
+                else
+                  let name = Ident.name id in
+                  Concr.add name deps)
+              pm.Env.module_revindex deps,
+            cons_pathmap (Env.persistent_pathmap env name) pms
+          else
+            acc in
+        let rec add_persistent name pms =
+          let deps, pms = add_persistent' (Concr.empty, pms) name in
+          Concr.fold add_persistent deps pms in
+
         let pm = List.fold_left
             (fun acc path ->
-               let name = Ident.name (Path.head path) in
-               cons_pathmap (Env.persistent_pathmap env name) acc)
+               let id = Path.head path in
+               if Ident.binding_time id = 0 then
+                 let name = Ident.name (Path.head path) in
+                 add_persistent name acc
+               else
+                 acc)
             Env.pathmap_empty opens in
         let op =
           let add_path t p = Pathtrie.add_path ~default:`Node p `Opened t in
@@ -310,39 +338,7 @@ module Shorten_prefix = struct
         table_cache := Some table;
         table
 
-        (*let register_opens opens acc =
-          let add_path t p = Pathtrie.add_path ~default:`Node p `Opened t in
-          let opened = List.fold_left add_path Tbl.empty opens in
-          let add_pathmap (tymap,aliasmap,aliasrev as acc) p =
-            let id = Path.head p in
-            if Ident.binding_time id <> 0 then
-              acc
-            else
-              let pm = Env.persistent_pathmap !printing_env (Ident.name id) in
-              Pathtrie.Map.fold (fun p1 x tymap ->
-                  let xs = match Pathtrie.Map.find p1 tymap with
-                    | xs -> xs
-                    | exception Not_found -> []
-                  in
-                  Pathtrie.Map.add p1 (x :: xs) tymap)
-                pm.Env.type_revindex tymap
-          in
-          let maps = List.fold_left add_pathmap
-              (Pathtrie.Map.empty,Tbl.empty,Pathtrie.Map.empty)
-              opens in
-          opened, maps
-        in
-        let remap_table, remap_index =
-          let aliases = find_summary_aliases [] (Env.summary !printing_env) in
-          register_aliases aliases remap_table in
-
-        let opens = find_opens [] (Env.summary !printing_env) in
-        let table = register_opens opens (remap_table, Tbl.empty, remap_index) in
-
-        table_cache := Some table;
-        table*)
-
-  let shorten path_ =
+  let shorten path' =
     let open_table, pathmap = get_opened () in
     let rec apply_dots path = function
       | x :: xs -> apply_dots (Path.Pdot (path, x, 0)) xs
@@ -360,7 +356,7 @@ module Shorten_prefix = struct
         else
           apply_dots (Path.Papply (t1, t2)) acc
 
-    and simplify org id path_ =
+    and simplify org id path' =
       try
         let rec shorten_path map path = match path with
           | [] -> raise Not_found
@@ -382,36 +378,51 @@ module Shorten_prefix = struct
         in
 
         let remap_path id xs =
-          let rec find_remap map = function
+          let rec find_remap map pathss =
+            Format.eprintf "entering %s\n%!" (String.concat "." pathss);
+            match pathss with
             | [] -> raise Not_found
-            | (x :: xs as path) ->
+            | (x :: xs as flat) ->
               match map.Pathtrie.value with
-              | Some path' ->
-                let x, xs = Pathtrie.flatten_path
-                    (List.hd (Pathtrie.Map.find path' pathmap.Env.module_revindex)) in
-                shorten_root x (xs @ path)
+              | Some path'' ->
+                Format.eprintf "remapping %a\n%!" path path'';
+                let candidates =
+                  try Pathtrie.Map.find path'' pathmap.Env.module_revindex
+                  with Not_found -> assert false in
+                let candidates = List.rev candidates in
+                List.iter (Format.eprintf "remap candidate: %a\n%!" path) candidates;
+                let x, xs = Pathtrie.flatten_path (List.hd candidates) in
+                shorten_root x (xs @ flat)
               | None ->
                 find_remap (Pathtrie.StringMap.find x map.Pathtrie.subs) xs
           in
-          match find_remap (Tbl.find id pathmap.Env.module_index) xs with
-          | exception Not_found -> shorten_root id xs
-          | path' -> path'
+          try
+            let map =
+              try Tbl.find id pathmap.Env.module_index
+              with Not_found ->
+                Format.eprintf "module not in index %a\n%!" ident id;
+                if Ident.binding_time id = 0 then
+                  Tbl.find id (Env.persistent_pathmap !printing_env (Ident.name id)).Env.module_index
+                else
+                  raise Not_found
+            in
+            find_remap map xs
+          with Not_found -> shorten_root id xs
         in
-        Format.eprintf "before remap: %a.%s\n%!" ident id (String.concat "." path_);
-        let id, path_ = remap_path id path_ in
-        Format.eprintf "after remap: %s.%s\n%!" id (String.concat "." path_);
+        Format.eprintf "before remap: %a.%s\n%!" ident id (String.concat "." path');
+        let id, path' = remap_path id path' in
+        Format.eprintf "after remap: %s.%s\n%!" id (String.concat "." path');
         (* FIXME? Fake ident *)
-        apply_dots (Path.Pident (Ident.create_persistent id)) path_
+        apply_dots (Path.Pident (Ident.create_persistent id)) path'
       with Not_found -> org
     in
 
-    traverse_path path_ [] path_
+    traverse_path path' [] path'
 end
 
 let same_type t t' = repr t == repr t'
 
 let same_printing_env env =
-  let used_pers = Env.used_persistent () in
   Env.same_types !printing_old env
 
 let set_printing_env env =
@@ -419,8 +430,11 @@ let set_printing_env env =
   Shorten_prefix.table_cache := None;
   if !printing_env == Env.empty || same_printing_env env then () else
   begin
-    let _, pm = Shorten_prefix.get_opened () in
-    printing_map := Pathtrie.Map.map pm.Env.type_revindex
+    printing_map := lazy begin
+      let _, pm = Shorten_prefix.get_opened () in
+      let to_paths paths = ref (Paths paths) in
+      Pathtrie.Map.map to_paths pm.Env.type_revindex
+    end
   end
 
 let wrap_printing_env env f =
@@ -450,13 +464,16 @@ let rec get_best_path r =
   | Paths [] -> raise Not_found
   | Paths l ->
       r := Paths [];
+      Format.eprintf "best_path_candidates:\n%!";
+      List.iter (Format.eprintf "- %a\n%!" path) l;
       List.iter
         (fun p ->
-          (* Format.eprintf "evaluating %a@." path p; *)
-          match !r with
-            Best p' when Path.size p >= Path.size p' -> ()
-          | _ -> if is_unambiguous p !printing_env then r := Best p)
-              (* else Format.eprintf "%a ignored as ambiguous@." path p *)
+           let p = Shorten_prefix.shorten p in
+           (* Format.eprintf "evaluating %a@." path p; *)
+           match !r with
+             Best p' when Path.size p >= Path.size p' -> ()
+           | _ -> (*if is_unambiguous p !printing_env then*) r := Best p)
+        (* else Format.eprintf "%a ignored as ambiguous@." path p *)
         l;
       get_best_path r
 
@@ -468,11 +485,13 @@ let best_type_path p =
     | `Slow  ->
       let (p', s) = Env.normalize_type_path !printing_env p in
       let p'' =
-        try get_best_path (Pathtrie.Map.find  p' (Lazy.force !printing_map))
-        with Not_found -> p'
+        try get_best_path (Pathtrie.Map.find p' (Lazy.force !printing_map))
+        with Not_found ->
+          Format.eprintf "path not found %a\n%!" path p';
+          p'
       in
       (* Format.eprintf "%a = %a -> %a@." path p path p' path p''; *)
-      (p'', s)
+      (Shorten_prefix.shorten p'', s)
 
 (* Print a type expression *)
 

@@ -167,7 +167,7 @@ module Sexp = struct
     let fd = Unix.descr_of_in_channel ic in
     let getch = ref (fun () -> '\000') in
     let rest = ref None in
-    let buffer = String.create 1024 in
+    let buffer = Bytes.create 1024 in
     let getch () =
       match !rest with
       | Some r ->

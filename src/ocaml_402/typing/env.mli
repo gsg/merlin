@@ -267,7 +267,7 @@ val normalize_type_path: ?cache:bool -> t -> Path.t -> Path.t * param_subst
 type pathmap = {
   (* Map a canonical type path (abstract or generative) to an alias in current
      module, with a substitution for type parameters *)
-  type_revindex: (Path.t * param_subst) list Pathtrie.Map.t;
+  type_revindex: Path.t list Pathtrie.Map.t;
   (* Map a path in current module to a canonically expanded module path
     (without aliases) *)
   module_index: Path.t option Pathtrie.t;
