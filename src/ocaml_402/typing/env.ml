@@ -204,10 +204,22 @@ type param_subst = Id | Nth of int | Map of int list
 
 (* Persistent structure descriptions *)
 
+type pathmap = {
+  (* Map a canonical type path (abstract or generative) to an alias in current
+     module, with a substitution for type parameters *)
+  type_revindex: (Path.t * param_subst) list Pathtrie.Map.t;
+  (* Map a path in current module to a canonically expanded module path
+    (without aliases) *)
+  module_index: Path.t option Pathtrie.t;
+  (* Map a canonical module path (without aliases) to the shortest alias in
+     current module *)
+  module_revindex: Path.t list Pathtrie.Map.t;
+}
+
 type pers_struct =
   { ps_name: string;
     ps_sig: signature;
-    mutable ps_short_pathmap: (Path.t * param_subst) Pathtrie.Map.t option;
+    mutable ps_short_pathmap: pathmap option;
     ps_comps: module_components;
     ps_crcs: (string * Digest.t option) list;
     mutable ps_crcs_checked: bool;
@@ -1152,7 +1164,7 @@ let normalize_type_path ?(cache = false) env p =
   in
   aux p
 
-let compute_type_map env name sg =
+let compute_type_map env root sg =
   let rec fold_types f path acc = function
     | Sig_type (id, _, _) :: xs ->
       fold_types f path (f (Path.Pdot (path, Ident.name id, 0)) acc) xs
@@ -1165,32 +1177,29 @@ let compute_type_map env name sg =
     let path', subst = normalize_type_path ~cache:true env path in
     if Path.same path path' then
       acc
-    else
-    if try
-        let pold, _ = Pathtrie.Map.find path' acc in
-        Path.size path < Path.size pold
+    else if try
+        match Pathtrie.Map.find path' acc with
+        | (pold, _) :: _ -> Path.size path < Path.size pold
+        | _ -> true
       with Not_found -> true
-    then
-      Pathtrie.Map.add path' (path, subst) acc
-    else
-      acc
+    then Pathtrie.Map.add path' [path, subst] acc
+    else acc
   in
-  let root = Path.Pident (Ident.create_persistent name) in
   let map = Pathtrie.Map.empty in
   fold_types register_type root map sg
 
-let compute_alias_map env name sg =
-  let rec expand_alias path =
-    match find_module path env with
-    | { md_type = Mty_alias path' } -> expand_alias path'
-    | _ -> path
-    | exception Not_found -> path in
+let rec expand_alias path env =
+  match find_module path env with
+  | { md_type = Mty_alias path' } -> expand_alias path' env
+  | _ -> path
+  | exception Not_found -> path
 
+let compute_alias_map env root sg =
   let rec find_module_aliases acc path = function
     | Mty_ident _ -> acc
     | Mty_signature (lazy sg) -> find_sig_aliases acc path sg
     | Mty_functor _ -> acc
-    | Mty_alias path' -> (path, expand_alias path') :: acc
+    | Mty_alias path' -> (path, expand_alias path' env) :: acc
 
   and find_sig_aliases acc path = function
     | Sig_module (id, { md_type }, _) :: tail ->
@@ -1198,24 +1207,51 @@ let compute_alias_map env name sg =
       find_sig_aliases acc path tail
     | _ :: tail ->
       find_sig_aliases acc path tail
-    | [] -> acc
+    | [] -> acc in
 
-  in
-  let root = Path.Pident (Ident.create_persistent name) in
   let aliases = find_sig_aliases [] root sg in
-  ()
+  let register_alias (index, revindex) (path, dest) =
+    Pathtrie.add_path ~default:None path (Some dest) index,
+    begin if try
+        match Pathtrie.Map.find dest revindex with
+        | pold :: _ -> Path.size path < Path.size pold
+        | _ -> true
+      with Not_found -> true
+      then Pathtrie.Map.add dest [path] revindex
+      else revindex
+    end in
+  List.fold_left register_alias (Tbl.empty, Pathtrie.Map.empty) aliases
 
+let compute_pathmap env root sg =
+  let type_revindex = compute_type_map env root sg in
+  let module_index, module_revindex = compute_alias_map env root sg in
+  {type_revindex; module_index; module_revindex}
 
+let pathmap_empty = {
+  type_revindex = Pathtrie.Map.empty;
+  module_index = Tbl.empty;
+  module_revindex = Pathtrie.Map.empty;
+}
 
-let persistent_type_map env name =
+let persistent_pathmap env name =
   match Hashtbl.find !cache.persistent_structures name with
-  | exception Not_found -> Pathtrie.Map.empty
-  | None -> Pathtrie.Map.empty
+  | exception Not_found -> pathmap_empty
+  | None -> pathmap_empty
   | Some { ps_short_pathmap = Some map } -> map
   | Some ps ->
-    let map = compute_type_map env name ps.ps_sig in
+    let root = Path.Pident (Ident.create_persistent name) in
+    let type_revindex = compute_type_map env root ps.ps_sig in
+    let module_index, module_revindex =
+      compute_alias_map env root ps.ps_sig in
+    let map = {type_revindex; module_index; module_revindex} in
     ps.ps_short_pathmap <- Some map;
     map
+
+let compute_pathmap env path = function
+  | Mty_ident _ -> pathmap_empty
+  | Mty_alias _ -> pathmap_empty (*fixme?*)
+  | Mty_signature (lazy sg) -> compute_pathmap env path sg
+  | Mty_functor _ -> pathmap_empty
 
 (* Compute constructor descriptions *)
 

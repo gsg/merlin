@@ -261,9 +261,24 @@ val fold_cltypes:
 val scrape_alias: t -> module_type -> module_type
 
 type param_subst = Id | Nth of int | Map of int list
+
 val normalize_type_path: ?cache:bool -> t -> Path.t -> Path.t * param_subst
 
-val persistent_type_map: t -> string -> (Path.t * param_subst) Pathtrie.Map.t
+type pathmap = {
+  (* Map a canonical type path (abstract or generative) to an alias in current
+     module, with a substitution for type parameters *)
+  type_revindex: (Path.t * param_subst) list Pathtrie.Map.t;
+  (* Map a path in current module to a canonically expanded module path
+    (without aliases) *)
+  module_index: Path.t option Pathtrie.t;
+  (* Map a canonical module path (without aliases) to the shortest alias in
+     current module *)
+  module_revindex: Path.t list Pathtrie.Map.t;
+}
+
+val pathmap_empty: pathmap
+val compute_pathmap: t -> Path.t -> Types.module_type -> pathmap
+val persistent_pathmap: t -> string -> pathmap
 
 (** merlin: manage all internal state *)
 

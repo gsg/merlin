@@ -210,7 +210,6 @@ type best_path = Paths of Path.t list | Best of Path.t
 
 let printing_env = ref Env.empty
 let printing_old = ref Env.empty
-let printing_pers = ref Concr.empty
 let printing_map = ref (Lazy.from_val Pathtrie.Map.empty)
 
 module Shorten_prefix = struct
@@ -253,15 +252,6 @@ module Shorten_prefix = struct
     | Env.Env_module (s, id, { md_type }) ->
       find_summary_aliases (find_module_aliases acc (Pident id) md_type) s
 
-  let find_pers_aliases acc env =
-    let aux name acc =
-      let path = Pident (Ident.create_persistent name) in
-      match Env.find_module path env with
-      | exception Not_found -> acc
-      | { md_type } -> find_module_aliases acc path md_type
-    in
-    Concr.fold aux (Env.used_persistent ()) acc
-
   let rec find_opens opens = function
     | Env.Env_empty -> opens
     | Env.Env_value (s, _, _) | Env.Env_type (s, _, _)
@@ -271,64 +261,77 @@ module Shorten_prefix = struct
       find_opens opens s
     | Env.Env_open (s, p) ->
       match Pathtrie.flatten_path p with
-      | exception Pathtrie.Invalid_path ->
-        opens
-      | flat -> find_opens ((p, flat) :: opens) s
+      | exception Pathtrie.Invalid_path -> assert false
+      | flat -> find_opens (p :: opens) s
 
   let table_pers_last = ref Concr.empty
   let table_pers = ref (Tbl.empty, Pathtrie.Map.empty)
 
   let table_cache = ref None
 
+  let cons_pathmap x xs =
+    { Env.
+      type_revindex =
+        Pathtrie.Map.fold (fun p1 x tymap ->
+            let xs = match Pathtrie.Map.find p1 tymap with
+              | xs -> xs
+              | exception Not_found -> []
+            in
+            Pathtrie.Map.add p1 (x @ xs) tymap)
+            x.Env.type_revindex xs.Env.type_revindex;
+      module_index = Tbl.fold Tbl.add x.Env.module_index xs.Env.module_index;
+      module_revindex =
+        Pathtrie.Map.fold (fun p1 x tymap ->
+            let xs = match Pathtrie.Map.find p1 tymap with
+              | xs -> xs
+              | exception Not_found -> []
+            in
+            Pathtrie.Map.add p1 (x @ xs) tymap)
+          x.Env.module_revindex xs.Env.module_revindex;
+    }
+
   let get_opened () =
     if !printing_env == Env.empty then
-      Tbl.empty, Tbl.empty, Pathtrie.Map.empty
+      Tbl.empty, Env.pathmap_empty
     else match !table_cache with
       | Some map -> map
       | None ->
-        let register_aliases aliases acc =
-          List.fold_left (fun (table, revindex) (src, dst, canonical) ->
-              Format.eprintf "%a is an alias to %a (absolute name: %a)\n%!"
-                path src path dst path canonical;
-              let rec traverse_path acc = function
-                | Papply _ -> raise Not_found
-                | Pdot (path, name, _) -> traverse_path (name :: acc) path
-                | Pident id -> id, acc in
-              match traverse_path [] src, traverse_path [] dst with
-              | exception Not_found -> table, revindex
-              | flat1, flat2 ->
-                let table = Pathtrie.add_flat ~default:`Node
-                    flat2 (`Remap canonical) table in
-                let table = Pathtrie.add_flat ~default:`Node
-                    flat1 (`Remap canonical) table in
-                table,
-                (*let list = match Pathtrie.Map.find canonical revindex with
-                  | result -> result
-                  | exception Not_found -> []
-                in*)
-                Pathtrie.Map.add canonical flat1 revindex
-            ) acc aliases in
+        let env = !printing_env in
+        let opens = find_opens [] (Env.summary env) in
+        let pm = List.fold_left
+            (fun acc path ->
+               let name = Ident.name (Path.head path) in
+               cons_pathmap (Env.persistent_pathmap env name) acc)
+            Env.pathmap_empty opens in
+        let op =
+          let add_path t p = Pathtrie.add_path ~default:`Node p `Opened t in
+          List.fold_left add_path Tbl.empty opens in
+        let table = op, pm in
+        table_cache := Some table;
+        table
 
-        let register_opens opens acc =
-          List.fold_left (fun (remap_table, open_table, revindex) (path, flat) ->
-              let path' = expand_alias path !printing_env in
-              Pathtrie.add_flat ~default:`Node flat (`Remap path') remap_table,
-              Pathtrie.add_flat ~default:`Node flat `Opened open_table,
-              Pathtrie.Map.add path' flat revindex
-            ) acc opens in
-
-        let remap_table =
-          let pers = Env.used_persistent () in
-          if Concr.equal pers !table_pers_last then
-            !table_pers
-          else
-            let aliases = find_pers_aliases [] !printing_env in
-            let table = register_aliases aliases (Tbl.empty, Pathtrie.Map.empty) in
-            table_pers_last := pers;
-            table_pers := table;
-            table
+        (*let register_opens opens acc =
+          let add_path t p = Pathtrie.add_path ~default:`Node p `Opened t in
+          let opened = List.fold_left add_path Tbl.empty opens in
+          let add_pathmap (tymap,aliasmap,aliasrev as acc) p =
+            let id = Path.head p in
+            if Ident.binding_time id <> 0 then
+              acc
+            else
+              let pm = Env.persistent_pathmap !printing_env (Ident.name id) in
+              Pathtrie.Map.fold (fun p1 x tymap ->
+                  let xs = match Pathtrie.Map.find p1 tymap with
+                    | xs -> xs
+                    | exception Not_found -> []
+                  in
+                  Pathtrie.Map.add p1 (x :: xs) tymap)
+                pm.Env.type_revindex tymap
+          in
+          let maps = List.fold_left add_pathmap
+              (Pathtrie.Map.empty,Tbl.empty,Pathtrie.Map.empty)
+              opens in
+          opened, maps
         in
-
         let remap_table, remap_index =
           let aliases = find_summary_aliases [] (Env.summary !printing_env) in
           register_aliases aliases remap_table in
@@ -337,10 +340,10 @@ module Shorten_prefix = struct
         let table = register_opens opens (remap_table, Tbl.empty, remap_index) in
 
         table_cache := Some table;
-        table
+        table*)
 
   let shorten path_ =
-    let remap_table, open_table, remap_index = get_opened () in
+    let open_table, pathmap = get_opened () in
     let rec apply_dots path = function
       | x :: xs -> apply_dots (Path.Pdot (path, x, 0)) xs
       | [] -> path
@@ -383,13 +386,14 @@ module Shorten_prefix = struct
             | [] -> raise Not_found
             | (x :: xs as path) ->
               match map.Pathtrie.value with
-              | `Remap path' ->
-                let x, xs = Pathtrie.Map.find path' remap_index in
+              | Some path' ->
+                let x, xs = Pathtrie.flatten_path
+                    (List.hd (Pathtrie.Map.find path' pathmap.Env.module_revindex)) in
                 shorten_root x (xs @ path)
-              | `Node ->
+              | None ->
                 find_remap (Pathtrie.StringMap.find x map.Pathtrie.subs) xs
           in
-          match find_remap (Tbl.find id remap_table) xs with
+          match find_remap (Tbl.find id pathmap.Env.module_index) xs with
           | exception Not_found -> shorten_root id xs
           | path' -> path'
         in
@@ -408,34 +412,15 @@ let same_type t t' = repr t == repr t'
 
 let same_printing_env env =
   let used_pers = Env.used_persistent () in
-  Env.same_types !printing_old env && Concr.equal !printing_pers used_pers
+  Env.same_types !printing_old env
 
 let set_printing_env env =
   printing_env := if Clflags.real_paths () = `Real then Env.empty else env;
   Shorten_prefix.table_cache := None;
   if !printing_env == Env.empty || same_printing_env env then () else
   begin
-    (* printf "Reset printing_map@."; *)
-    printing_old := env;
-    printing_pers := Env.used_persistent ();
-    printing_map := lazy begin
-      (* printf "Recompute printing_map.@."; *)
-      let map = ref Pathtrie.Map.empty in
-      Env.iter_types
-        (fun p (p', decl) ->
-          let (p1, s1) = Env.normalize_type_path env p' ~cache:true in
-          (* Format.eprintf "%a -> %a = %a@." path p path p' path p1 *)
-          if s1 = Env.Id then
-          try
-            let r = Pathtrie.Map.find p1 !map in
-            match !r with
-              Paths l -> r := Paths (p :: l)
-            | Best _  -> assert false
-          with Not_found ->
-            map := Pathtrie.Map.add p1 (ref (Paths [p])) !map)
-        env;
-      !map
-    end
+    let _, pm = Shorten_prefix.get_opened () in
+    printing_map := Pathtrie.Map.map pm.Env.type_revindex
   end
 
 let wrap_printing_env env f =
