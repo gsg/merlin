@@ -1,0 +1,56 @@
+OCAMLFLAGS += -w -3
+
+ifdef WITH_BIN_ANNOT
+	OCAMLFLAGS += -bin-annot
+endif
+
+ifdef WITH_DEBUG
+	OCAMLFLAGS += -g
+	OCAMLLDFLAGS += -g
+endif
+
+RESULT ?= ocamlindexer
+TYPER  ?= src/ocaml$(MERLIN_OCAML_VERSION)
+
+SOURCES = \
+	src/utils/terminfo.mli            \
+	src/utils/terminfo.ml             \
+	src/utils/std.ml                  \
+	src/utils/misc.mli                \
+	src/utils/misc.ml                 \
+	src/utils/file_cache.mli      \
+	src/utils/file_cache.ml       \
+	src/utils/logger.mli              \
+	src/utils/logger.ml               \
+	src/utils/menhirLib.ml            \
+	src/utils/menhirUtils.mli         \
+	src/utils/menhirUtils.ml          \
+	$(TYPER)/utils/warnings.mli       \
+	$(TYPER)/utils/warnings.ml        \
+	$(TYPER)/utils/config.mli         \
+	$(TYPER)/utils/config.ml          \
+	src/ocaml_aux/clflags.mli         \
+	src/ocaml_aux/clflags.ml          \
+	$(TYPER)/parsing/location.mli     \
+	$(TYPER)/parsing/location.ml      \
+	$(TYPER)/typing/annot.mli         \
+	$(TYPER)/typing/outcometree.mli   \
+	$(TYPER)/typing/ident.mli         \
+	$(TYPER)/typing/ident.ml          \
+	$(TYPER)/typing/path.mli          \
+	$(TYPER)/typing/path.ml           \
+	$(TYPER)/typing/primitive.mli     \
+	$(TYPER)/typing/primitive.ml      \
+	$(TYPER)/typing/types.mli         \
+	$(TYPER)/typing/types.ml          \
+	$(TYPER)/typing/btype.mli         \
+	$(TYPER)/typing/btype.ml          \
+	$(TYPER)/typing/cmi_format.mli    \
+	$(TYPER)/typing/cmi_format.ml     \
+	src/indexer/indexer.ml
+
+PACKS = findlib yojson unix dbm
+
+$(RESULT): native-code
+
+-include OCamlMakefile
