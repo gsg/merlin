@@ -168,7 +168,7 @@ def parse_position(pos):
 def display_load_failures(result):
   if 'failures' in result:
       for failure in result['failures']:
-          print failure
+          print(failure)
   return result['result']
 
 def command_tell(content):
@@ -322,7 +322,6 @@ def vim_complete_cursor(base, vimvar):
   line, col = vim.current.window.cursor
   wspaces = re.compile("[\n ]+")
   try:
-    sync_buffer()
     props = command_complete_cursor(base,line,col)
     for prop in props:
       vim.command("let l:tmp = {'word':'%s','menu':'%s','info':'%s','kind':'%s'}" %
