@@ -17,7 +17,7 @@ OCAML_VERSIONS = 401 402
 
 #### Invocation of OCamlMakefile
 
-OCAMLMAKEFILE= $(MAKE) -f Makefile.ocamlmakefile \
+OCAMLMAKEFILE= $(MAKE) -f Makefile.merlin \
 							 WITH_BIN_ANNOT="$(WITH_BIN_ANNOT)" WITH_DEBUG="$(WITH_DEBUG)"
 
 ifndef VERBOSE
